@@ -30,6 +30,7 @@ parser.add_argument("-t","--test_episode", type = int, default = 600)
 parser.add_argument("-l","--learning_rate", type = float, default = 0.001)
 parser.add_argument("-g","--gpu",type=int, default=0)
 parser.add_argument("-u","--hidden_unit",type=int,default=10)
+parser.add_argument("-all","--all_pairs",type=bool, default=False)
 args = parser.parse_args()
 
 
@@ -44,6 +45,8 @@ TEST_EPISODE = args.test_episode
 LEARNING_RATE = args.learning_rate
 GPU = args.gpu
 HIDDEN_UNIT = args.hidden_unit
+ALL_PAIRS = args.all_pairs
+print(ALL_PAIRS)
 
 def mean_confidence_interval(data, confidence=0.95):
     a = 1.0*np.array(data)
@@ -174,24 +177,48 @@ def main():
         samples,sample_labels = sample_dataloader.__iter__().next() #25*3*84*84
         batches,batch_labels = batch_dataloader.__iter__().next()
 
-        # calculate features
-        sample_features = feature_encoder(Variable(samples).cuda(GPU)) # 25*64*19*19
-        sample_features = sample_features.view(CLASS_NUM,SAMPLE_NUM_PER_CLASS,FEATURE_DIM,19,19)
-        sample_features = torch.sum(sample_features,1).squeeze(1)
-        batch_features = feature_encoder(Variable(batches).cuda(GPU)) # 20x64*5*5
+        if ALL_PAIRS:
+            total = torch.cat((samples, batches))
 
-        # calculate relations
-        # each batch sample link to every samples to calculate relations
-        # to form a 100x128 matrix for relation network
-        sample_features_ext = sample_features.unsqueeze(0).repeat(BATCH_NUM_PER_CLASS*CLASS_NUM,1,1,1,1)
-        batch_features_ext = batch_features.unsqueeze(0).repeat(CLASS_NUM,1,1,1,1)
-        batch_features_ext = torch.transpose(batch_features_ext,0,1)
-        relation_pairs = torch.cat((sample_features_ext,batch_features_ext),2).view(-1,FEATURE_DIM*2,19,19)
-        relations = relation_network(relation_pairs).view(-1,CLASS_NUM)
+            total_features = feature_encoder(Variable(total).cuda(GPU))
+            total_features_ext = total_features.unsqueeze(0).repeat((BATCH_NUM_PER_CLASS+SAMPLE_NUM_PER_CLASS)*CLASS_NUM,1,1,1,1)
+            total_features_ext_transpose = torch.transpose(total_features_ext,0,1)
 
-        mse = nn.MSELoss().cuda(GPU)
-        one_hot_labels = Variable(torch.zeros(BATCH_NUM_PER_CLASS*CLASS_NUM, CLASS_NUM).scatter_(1, batch_labels.view(-1,1), 1).cuda(GPU))
-        loss = mse(relations,one_hot_labels)
+
+            relation_pairs = torch.cat((total_features_ext,total_features_ext_transpose),2).view(-1,FEATURE_DIM*2,19,19)
+            relations = relation_network(relation_pairs).view(-1,CLASS_NUM*(SAMPLE_NUM_PER_CLASS + BATCH_NUM_PER_CLASS))
+
+            mse = nn.MSELoss().cuda(GPU)
+
+            all_labels = torch.cat((sample_labels, batch_labels))
+            one_hot_labels = Variable(torch.zeros((BATCH_NUM_PER_CLASS+SAMPLE_NUM_PER_CLASS)*CLASS_NUM, CLASS_NUM).scatter_(1, all_labels.view(-1,1), 1)).cuda(GPU)
+
+            one_hot_labels = torch.zeros(all_labels.shape[0], all_labels.shape[0]).cuda(GPU)
+            for i, lab1 in enumerate(all_labels):
+                for j, lab2 in enumerate(all_labels):
+                    if int(lab1) == int(lab2):
+                        one_hot_labels[int(i),int(j)] = 1
+                                                           
+            loss = mse(relations,one_hot_labels)
+        else:
+            # calculate features
+            sample_features = feature_encoder(Variable(samples).cuda(GPU)) # 25*64*19*19
+            sample_features = sample_features.view(CLASS_NUM,SAMPLE_NUM_PER_CLASS,FEATURE_DIM,19,19)
+            sample_features = torch.sum(sample_features,1).squeeze(1)
+            batch_features = feature_encoder(Variable(batches).cuda(GPU)) # 20x64*5*5
+
+            # calculate relations
+            # each batch sample link to every samples to calculate relations
+            # to form a 100x128 matrix for relation network
+            sample_features_ext = sample_features.unsqueeze(0).repeat(BATCH_NUM_PER_CLASS*CLASS_NUM,1,1,1,1)
+            batch_features_ext = batch_features.unsqueeze(0).repeat(CLASS_NUM,1,1,1,1)
+            batch_features_ext = torch.transpose(batch_features_ext,0,1)
+            relation_pairs = torch.cat((sample_features_ext,batch_features_ext),2).view(-1,FEATURE_DIM*2,19,19)
+            relations = relation_network(relation_pairs).view(-1,CLASS_NUM)
+
+            mse = nn.MSELoss().cuda(GPU)
+            one_hot_labels = Variable(torch.zeros(BATCH_NUM_PER_CLASS*CLASS_NUM, CLASS_NUM).scatter_(1, batch_labels.view(-1,1), 1).cuda(GPU))
+            loss = mse(relations,one_hot_labels)
 
 
         # training
@@ -209,7 +236,7 @@ def main():
 
 
         if (episode+1)%100 == 0:
-                print("episode:",episode+1,"loss",loss.data[0])
+                print("episode:",episode+1,"loss",loss.data.item())
 
         if episode%5000 == 0:
 
@@ -244,6 +271,8 @@ def main():
 
                     _,predict_labels = torch.max(relations.data,1)
 
+                    predict_labels = predict_labels.cuda()
+                    test_labels = test_labels.cuda()
                     rewards = [1 if predict_labels[j]==test_labels[j] else 0 for j in range(batch_size)]
 
                     total_rewards += np.sum(rewards)
